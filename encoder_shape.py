@@ -5,7 +5,7 @@ import sys
 def conv_circ( signal, ker ):
     return np.real(np.fft.ifft( np.fft.fft(signal)*np.fft.fft(ker) )) / len(ker)
 
-N = 16*3
+N = 32*16*3
 assert(N % 6 == 0)
 W = 2.0 * np.pi / 3.0
 angle = np.linspace(0.0, 2.0 * np.pi, N)
@@ -105,44 +105,10 @@ curve_x = np.concat((angle, np.flip(angle)))
 #curve_y = np.concat((height_p1[0:N//4], np.full(N//4, 1.0), np.flip(height_p1[0:N//4]), np.full(N//4, 0.0)))
 #curve_x = np.concat((angle[0:N//2], np.flip(angle[0:N//2])))
 #plt.plot(curve_x, curve_y)
-if False:
+if True:
     for da in [0.0, 2.0*np.pi/3, 4.0*np.pi/3]:
         plt.polar(curve_x + da, inner_radius + total_height * curve_y)
 
-
-f = open('test.lst', 'w')
-z = 0.0
-
-def output_poly(f, name, low, high, z):
-    mid = (low+high)*0.5
-    low = low + (mid - low)*0.01
-    high = high + (mid - high)*0.01
-    low_cart = (np.cos(angle) * (inner_radius + total_height * low), np.sin(angle) * (inner_radius + total_height * low))
-    high_cart = (np.cos(angle) * (inner_radius + total_height * high), np.sin(angle) * (inner_radius + total_height * high))
-    output_poly_cart(f, name, low_cart, high_cart, z)
-def output_poly_cart(f, name, low_cart, high_cart, z):
-    for i in range(len(low)-1):
-        l0 = (low_cart[0][i],low_cart[1][i])
-        h0 = (high_cart[0][i],high_cart[1][i])
-        l1 = (low_cart[0][i+1],low_cart[1][i+1])
-        h1 = (high_cart[0][i+1], high_cart[1][i+1])
-        if np.isclose(l0, h0).all():
-            continue
-        if np.isclose(l1, h1).all():
-            continue
-        f.write(f"Q {name} {l0[0]:.20f} {l0[1]:.20f} {z:.20f} {l1[0]:.20f} {l1[1]:.20f} {z:.20f} {h1[0]:.20f} {h1[1]:.20f} {z:.20f} {h0[0]:.20f} {h0[1]:.20f} {z:.20f}\n")
-
-output_poly(f, "plate_1", low, high, 0.0)
-output_poly(f, "plate_2", np.roll(low, N//3), np.roll(high, N//3), 0.0)
-output_poly(f, "plate_3", np.roll(low, 2*N//3), np.roll(high, 2*N//3), 0.0)
-
-x = np.linspace(-outer_radius, outer_radius, N)
-output_poly_cart(f, "rotor_1", (x, np.full(N, 0.1e-3)), (x, np.sqrt(outer_radius*outer_radius - x*x) + 0.1e-3), 1e-3)
-output_poly_cart(f, "rotor_2", (x, np.full(N, -0.1e-3)), (x, -np.sqrt(outer_radius*outer_radius - x*x) - 0.1e-3), 1e-3)
-output_poly_cart(f, "rotor_1", (x, np.full(N, 0.1e-3)), (x, np.sqrt(outer_radius*outer_radius - x*x) + 0.1e-3), -1e-3)
-output_poly_cart(f, "rotor_2", (x, np.full(N, -0.1e-3)), (x, -np.sqrt(outer_radius*outer_radius - x*x) - 0.1e-3), -1e-3)
-
-f.close()
 
 #plt.polar(angle, inner_radius + height_p1 * total_height)
 #r = inner_radius + height_p1 * total_height
@@ -162,3 +128,112 @@ plt.axis('equal')
 """
 
 plt.show()
+
+
+# gen footprint
+f = open('test.kicad_mod', 'w')
+
+points = ""
+for (x,y) in zip(curve_x, curve_y):
+    r = inner_radius + total_height * y
+    (x,y) = (np.cos(x)*r, np.sin(x)*r)
+    x_mm = x*1e3
+    y_mm = y*1e3
+    points += f"(xy {x_mm} {y_mm})"
+
+primitives = f"""
+(gr_poly
+	(pts {points}
+	)
+	(width 0.0)
+	(fill yes)
+)"""
+
+footprint_text = f"""
+(footprint "StatorTx"
+	(version 20260206)
+	(generator "me")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(property "Reference" "REF**"
+		(at 0 -0.5 0)
+		(unlocked yes)
+		(layer "F.SilkS")
+		(uuid "aad3c48b-ea91-4c02-ab62-e1e8f505299c")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.1)
+			)
+		)
+	)
+	(property "Value" "Untitled"
+		(at 0 1 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(uuid "c33fb2a9-4585-48ac-aef3-23aa1b2cc5e5")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "8db52979-e032-42c2-9101-c0ed8832c9d7")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "376ad0a7-2890-4bcd-be53-35fabd68095b")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr smd)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_text user "${{REFERENCE}}"
+		(at 0 2.5 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(uuid "5027c18d-1e68-4ed7-95f0-973edbbfdf72")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "2" smd custom
+		(at 0.0 0.0)
+		(size 6.5675 6.5675)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(options
+			(clearance outline)
+			(anchor rect)
+		)
+		(primitives
+		    {primitives}
+		)
+		(uuid "2762c063-429e-48b9-a0e8-d4ad42257a20")
+	)
+	(embedded_fonts no)
+)
+"""
+f.write(footprint_text)
+f.close()
