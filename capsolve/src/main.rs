@@ -1,3 +1,4 @@
+use bytemuck::{NoUninit, Pod, Zeroable};
 use std::{f32::consts::PI, num::NonZeroU64, str::FromStr};
 use wgpu::{Backends, InstanceFlags, include_spirv, include_spirv_raw, util::DeviceExt};
 
@@ -57,7 +58,56 @@ struct Plate {
     dim: Vec2,
 }
 
+#[derive(Pod, Clone, Copy, Zeroable)]
+#[repr(C, align(16))]
+struct PlateInfo {
+    origin: [f32; 3],
+    pad0: f32,
+    u: [f32; 3],
+    pad1: f32,
+    v: [f32; 3],
+    pad2: f32,
+    n: [f32; 3],
+    pad3: f32,
+    dim: [f32; 2],
+    pad4: [f32; 2],
+    box_min: [f32; 3],
+    pad5: f32,
+    box_max: [f32; 3],
+    pad6: f32,
+}
+
+const PLATE_COUNT: usize = 2;
+
+#[derive(Pod, Clone, Copy, Zeroable)]
+#[repr(C, align(16))]
+struct Consts {
+    plates: [PlateInfo; PLATE_COUNT],
+    seed: u32,
+    pad: [u32; 3],
+}
+
 impl Plate {
+    fn into_plate_info(&self) -> PlateInfo {
+        let (box_min, box_max) = self.enclosing_box(5.0 * MM * Vec3::ONE);
+        PlateInfo {
+            origin: self.origin.to_array(),
+            u: self.u.to_array(),
+            v: self.v.to_array(),
+            n: self.n.to_array(),
+            dim: self.dim.to_array(),
+            box_min: box_min.to_array(),
+            box_max: box_max.to_array(),
+            pad0: 0.0,
+            pad1: 0.0,
+            pad2: 0.0,
+            pad3: 0.0,
+            pad4: [0.0, 0.0],
+            pad5: 0.0,
+            pad6: 0.0,
+        }
+    }
+
     fn enclosing_box(&self, padding: Vec3) -> (Vec3, Vec3) {
         let min = self.origin - padding.x * self.u - padding.y * self.v - padding.z * self.n;
         let max = self.origin
@@ -126,7 +176,7 @@ fn sample_conditional_return_on_sphere(
     center + a * dir
 }
 
-fn main() {
+fn main_cpu() {
     let z1 = 10.0 * MM;
     let z2 = -10.0 * MM;
 
@@ -222,23 +272,42 @@ fn main() {
     }
 }
 
+struct Gpu {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+}
+
+const WORKGROUP_COUNT: u32 = 128 * 256;
+
 fn main_gpu() {
-    // Parse all arguments as floats. We need to skip argument 0, which is the name of the program.
-    let arguments: Vec<f32> = std::env::args()
-        .skip(1)
-        .map(|s| {
-            f32::from_str(&s).unwrap_or_else(|_| panic!("Cannot parse argument {s:?} as a float."))
-        })
-        .collect();
-
-    if arguments.is_empty() {
-        println!("No arguments provided. Please provide a list of numbers to double.");
-        return;
-    }
-
-    println!("Parsed {} arguments", arguments.len());
-
     env_logger::init();
+
+    let z1 = 10.0 * MM;
+    let z2 = -10.0 * MM;
+
+    let p1 = Plate {
+        origin: vec3(0.0, 0.0, z1),
+        u: Vec3::X,
+        v: Vec3::Y,
+        n: Vec3::Z,
+        dim: vec2(100.0 * MM, 100.0 * MM),
+    };
+    let p2 = Plate {
+        origin: vec3(0.0, 0.0, z2),
+        u: Vec3::X,
+        v: Vec3::Y,
+        n: Vec3::Z,
+        dim: vec2(100.0 * MM, 100.0 * MM),
+    };
+
+    let mut rng = Rng::new();
+    let seed = rng.u32(..);
+
+    let consts = Consts {
+        plates: [p1.into_plate_info(), p2.into_plate_info()],
+        seed,
+        pad: [0; 3],
+    };
 
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = Backends::VULKAN;
@@ -252,7 +321,7 @@ fn main_gpu() {
 
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: None,
-        required_features: wgpu::Features::SUBGROUP | wgpu::Features::PASSTHROUGH_SHADERS,
+        required_features: wgpu::Features::SUBGROUP,
         required_limits: wgpu::Limits::defaults(),
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         memory_hints: wgpu::MemoryHints::MemoryUsage,
@@ -261,24 +330,28 @@ fn main_gpu() {
     .expect("Failed to create device");
 
     //let module = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-    let module = device.create_shader_module(include_spirv!("shader.spv"));
+    let module = device.create_shader_module(include_spirv!(concat!(
+        env!("OUT_DIR"),
+        "/",
+        "shader.slang.spv"
+    )));
 
-    let input_data_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let consts_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
-        contents: bytemuck::cast_slice(&arguments),
-        usage: wgpu::BufferUsages::STORAGE,
+        contents: bytemuck::bytes_of(&consts),
+        usage: wgpu::BufferUsages::UNIFORM,
     });
 
     let output_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: input_data_buffer.size(),
+        size: (PLATE_COUNT * size_of::<f32>() * (WORKGROUP_COUNT as usize)) as u64,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
 
     let download_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: input_data_buffer.size(),
+        size: output_data_buffer.size(),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -286,18 +359,16 @@ fn main_gpu() {
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
         entries: &[
-            // Input buffer
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    min_binding_size: Some(NonZeroU64::new(4).unwrap()),
+                    ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
+                    min_binding_size: Some(NonZeroU64::new(size_of::<Consts>() as u64).unwrap()),
                 },
                 count: None,
             },
-            // Output buffer
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -307,21 +378,6 @@ fn main_gpu() {
                     has_dynamic_offset: false,
                 },
                 count: None,
-            },
-        ],
-    });
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: input_data_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: output_data_buffer.as_entire_binding(),
             },
         ],
     });
@@ -336,11 +392,27 @@ fn main_gpu() {
         label: None,
         layout: Some(&pipeline_layout),
         module: &module,
-        entry_point: Some("doubleMe"),
+        entry_point: Some("sample_walk"),
         compilation_options: wgpu::PipelineCompilationOptions::default(),
         cache: None,
     });
-    println!("pipe ok");
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: consts_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: output_data_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    println!("begin record");
     let mut cmd_buff =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
@@ -352,8 +424,7 @@ fn main_gpu() {
     compute_pass.set_pipeline(&pipeline);
     compute_pass.set_bind_group(0, &bind_group, &[]);
 
-    let workgroup_count = arguments.len().div_ceil(64);
-    compute_pass.dispatch_workgroups(workgroup_count as u32, 1, 1);
+    compute_pass.dispatch_workgroups(WORKGROUP_COUNT, 1, 1);
 
     drop(compute_pass);
 
@@ -368,6 +439,7 @@ fn main_gpu() {
     let cmd_buff = cmd_buff.finish();
     println!("submit !");
     queue.submit([cmd_buff]);
+    println!("submited !");
 
     let buffer_slice = download_buffer.slice(..);
     buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -378,4 +450,21 @@ fn main_gpu() {
     let result: Vec<f32> = bytemuck::allocation::pod_collect_to_vec(&data);
 
     println!("Result: {result:?}");
+
+    let mut mean = vec![0.0; PLATE_COUNT];
+    for i in 0..WORKGROUP_COUNT as usize {
+        for k in 0..PLATE_COUNT {
+            mean[k] += result[PLATE_COUNT * i + k];
+        }
+    }
+    for m in &mut mean {
+        *m /= (WORKGROUP_COUNT as f32);
+        *m *= 1e12;
+    }
+    println!("mean = {mean:?}");
+}
+
+fn main() {
+    //main_cpu();
+    main_gpu();
 }
