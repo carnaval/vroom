@@ -29,7 +29,8 @@ fn compile_slang(path: &Path, output_path: &Path) {
     }
 }
 
-fn main() {
+fn main2() {
+    /*
     let out_dir = env::var_os("OUT_DIR").unwrap();
 
     let shader_path = Path::new("src/shader.slang");
@@ -46,4 +47,21 @@ fn main() {
     // aaa
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed={shader_path:?}");
+    */
+}
+
+fn main() {
+    let slang_dir = PathBuf::from(env::var_os("SLANG_DIR").expect("SLANG_DIR missing"));
+
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+
+    for name in ["slang.dll", "slang-compiler.dll"] {
+        let src = slang_dir.join("bin").join(name);
+
+        fs::copy(&src, out.join(name)).unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+
+        println!("cargo::rerun-if-changed={}", src.display());
+    }
+
+    println!("cargo::rustc-link-search=native={}", out.display());
 }

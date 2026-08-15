@@ -21,8 +21,6 @@ ConstantBuffer<Consts> consts;
 [vk_binding(1, 0)]
 RWStructuredBuffer<f32> output;
 
-static const u32 TILE_SIDE = 8;
-
 struct PlateInfo {
     f32x3 origin;
     f32x3 u;
@@ -34,7 +32,11 @@ struct PlateInfo {
     f32x3 box_max;
 }
 
-static const u32 PLATE_COUNT = 2;
+extern static const u32 PLATE_COUNT;
+//extern static const bool IN;
+
+
+//static const u32 PLATE_COUNT = 2;
 
 struct Consts {
     PlateInfo plates[PLATE_COUNT];
@@ -185,40 +187,50 @@ f32x3 sample_conditional_return_on_sphere(f32x3 x, f32x3 center, f32 a, f32x2 ra
 }
 
 
-u32 walk_on_sphere(uint4 seed, f32x3 sp) {
-    f32 outside_radius = 1.0;
-    for (i32 it = 0; it < 3000; it++) {
-    //while (true) {
+u32 walk_on_sphere(uint4 seed, f32x3 sp, bool DEBUG, uint thread_id) {
+    f32 outside_radius = 0.25;
+    i32 step_count = 0;
+    //for (i32 it = 0; it < 3000; it++) {
+    while (true) {
         f32 sp_d2 = dot(sp,sp);
-        if (sp_d2 > 16.0 * outside_radius * outside_radius) {
+        if (sp_d2 > 4.0 * outside_radius * outside_radius) {
             f32 return_proba = outside_radius / sqrt(sp_d2);
             uint4 rand = pcg4d(seed);
             seed.w += 1;
             if (u32_to_f32_01(rand.x) > return_proba) {
+                if (DEBUG) {
+                printf("[%u] EXIT: step_count = %u\n", thread_id, step_count);
+                }
+
                 return INVALID;
             }
             sp = sample_conditional_return_on_sphere(sp, 0.xxx, outside_radius, f32x2(u32_to_f32_01(rand.y), u32_to_f32_01(rand.z)));
         }
         ClosestPoint cp = closest(sp);
         if (cp.sqdist < SURFACE_TOL * SURFACE_TOL){
+            if (DEBUG) {
+            printf("[%u] step_count = %u\n", thread_id, step_count);
+            }
+
             return cp.id;
         }
         let d = sqrt(cp.sqdist);
         let r = 0.999999 * d;
         sp += r * random_dir(seed);
         seed.w += 10;
-
+        step_count += 1;
     }
     return INVALID;
 }
 
-static const u32 WORKGROUP_SIZE = 64*4;
+static const u32 WORKGROUP_SIZE = 64;
 
 groupshared f32 shared_result[WORKGROUP_SIZE * PLATE_COUNT];
 
 [shader("compute")]
 [numthreads(WORKGROUP_SIZE,1,1)]
-void sample_walk(uint3 global_thread_id: SV_DispatchThreadID, uint group_thread_id: SV_GroupThreadID, uint3 workgroup_id: SV_GroupID) {
+void sample_walk(uint3 global_thread_id: SV_DispatchThreadID, uint3 group_thread_id: SV_GroupThreadID, uint3 workgroup_id: SV_GroupID) {
+    bool DEBUG = (workgroup_id.x == 0);
     u32 shared_base = group_thread_id.x * PLATE_COUNT;
     for (u32 i = 0; i < PLATE_COUNT; i++) {
         shared_result[shared_base + i] = 0.0;
@@ -246,9 +258,9 @@ void sample_walk(uint3 global_thread_id: SV_DispatchThreadID, uint group_thread_
 
     f32 w = -epsilon * (1.0 / pg) * (3.0 / (2.0 * r)) * dot(n, dir);
 
-    uint id_a = walk_on_sphere(seed, x_p);
+    uint id_a = walk_on_sphere(seed, x_p, DEBUG, group_thread_id.x);
     seed.z += 1;
-    uint id_b = walk_on_sphere(seed, x_m);
+    uint id_b = walk_on_sphere(seed, x_m, DEBUG, group_thread_id.x);
     seed.z += 1;
 
     if (id_a != INVALID) {
@@ -257,10 +269,11 @@ void sample_walk(uint3 global_thread_id: SV_DispatchThreadID, uint group_thread_
     if (id_b != INVALID) {
         shared_result[shared_base + id_b] += -w;
     }
-
+#if 1
     GroupMemoryBarrierWithGroupSync();
 
     if (group_thread_id.x == 0) {
+
         for (u32 i = 0; i < PLATE_COUNT; i++) {
             f32 result = 0.0;
             for (u32 j = 0; j < WORKGROUP_SIZE; j++) {
@@ -268,6 +281,7 @@ void sample_walk(uint3 global_thread_id: SV_DispatchThreadID, uint group_thread_
             }
             output[workgroup_id.x * PLATE_COUNT + i] = result / WORKGROUP_SIZE;
         }
-    }
 
+    }
+    #endif
 }

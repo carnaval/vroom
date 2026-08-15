@@ -9,4 +9,9 @@ env_logger = "0.11.11"
 fastrand = "2.5.0"
 glam = "0.33.3"
 pollster = "1.0.1"
+#shader-slang = "0.1.0"
+shader-slang = {
+    git = "https://github.com/FloatyMonkey/slang-rs",
+    branch = "main"
+}
 wgpu = {version="30.0.0", features=["spirv"]}

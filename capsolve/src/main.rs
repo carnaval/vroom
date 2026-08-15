@@ -1,6 +1,12 @@
 use bytemuck::{NoUninit, Pod, Zeroable};
-use std::{f32::consts::PI, num::NonZeroU64, str::FromStr};
-use wgpu::{Backends, InstanceFlags, include_spirv, include_spirv_raw, util::DeviceExt};
+use std::{
+    borrow::Cow, collections::HashMap, f32::consts::PI, num::NonZeroU64, str::FromStr,
+    time::Duration,
+};
+use wgpu::{
+    Backends, InstanceFlags, include_spirv, include_spirv_raw, util::DeviceExt,
+    wgc::SubmissionIndex,
+};
 
 use fastrand::Rng;
 use glam::{Vec2, Vec3, vec2, vec3};
@@ -212,25 +218,23 @@ fn main_cpu() {
 
     let outside_radius = 1.0;
 
-    let walk_on_sphere = |rng: &mut Rng, mut sp: Vec3| {
-        loop {
-            let sp_d2 = sp.length_squared();
-            if sp_d2 >= 16.0 * outside_radius * outside_radius {
-                let return_proba = outside_radius / f32::sqrt(sp_d2);
-                if rng.f32() > return_proba {
-                    return usize::MAX;
-                }
-                sp = sample_conditional_return_on_sphere(rng, sp, Vec3::ZERO, outside_radius);
-                continue;
+    let walk_on_sphere = |rng: &mut Rng, mut sp: Vec3| loop {
+        let sp_d2 = sp.length_squared();
+        if sp_d2 >= 16.0 * outside_radius * outside_radius {
+            let return_proba = outside_radius / f32::sqrt(sp_d2);
+            if rng.f32() > return_proba {
+                return usize::MAX;
             }
-            let (id, d2) = closest_sqdist(sp);
-            if d2 < SURFACE_TOL * SURFACE_TOL {
-                return id;
-            }
-            let d = f32::sqrt(d2);
-            let r = 0.999999 * d;
-            sp += r * random_dir(rng);
+            sp = sample_conditional_return_on_sphere(rng, sp, Vec3::ZERO, outside_radius);
+            continue;
         }
+        let (id, d2) = closest_sqdist(sp);
+        if d2 < SURFACE_TOL * SURFACE_TOL {
+            return id;
+        }
+        let d = f32::sqrt(d2);
+        let r = 0.999999 * d;
+        sp += r * random_dir(rng);
     };
 
     let mut result = vec![0.0f64; 2];
@@ -275,9 +279,288 @@ fn main_cpu() {
 struct Gpu {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
 }
 
-const WORKGROUP_COUNT: u32 = 128 * 256;
+fn init_gpu() -> Gpu {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = Backends::VULKAN;
+    let instance = wgpu::Instance::new(desc);
+
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .expect("Failed to create adapter");
+
+    println!("Running on Adapter: {:#?}", adapter.get_info());
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: None,
+        required_features: wgpu::Features::SUBGROUP
+            | wgpu::Features::TIMESTAMP_QUERY
+            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+            | wgpu::Features::PASSTHROUGH_SHADERS,
+        required_limits: wgpu::Limits::defaults(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        trace: wgpu::Trace::Off,
+    }))
+    .expect("Failed to create device");
+
+    Gpu {
+        instance,
+        adapter,
+        device,
+        queue,
+    }
+}
+
+#[derive(Debug)]
+struct Shaders {
+    pipeline_layout: wgpu::PipelineLayout,
+    pipelines: HashMap<String, wgpu::ComputePipeline>,
+    bind_group_layouts: Vec<wgpu::BindGroupLayout>,
+}
+
+fn compile_shaders(
+    gpu: &Gpu,
+    path: &str,
+    source: &str,
+    //bind_group_layout: wgpu::BindGroupLayout,
+    entry_point_names: &[&str],
+) -> Shaders {
+    let global_session = shader_slang::GlobalSession::new().unwrap();
+    println!("tag = {:?}", global_session.build_tag_string());
+    let target = shader_slang::TargetDesc::default()
+        .format(shader_slang::CompileTarget::Spirv)
+        .profile(global_session.find_profile("spirv_1_5"));
+
+    let targets = [target];
+
+    let options = shader_slang::CompilerOptions::default()
+        .vulkan_use_entry_point_name(true)
+        .debug_information(shader_slang::DebugInfoLevel::Minimal)
+        .optimization(shader_slang::OptimizationLevel::None);
+    let session_desc = shader_slang::SessionDesc::default()
+        .targets(&targets)
+        .options(&options);
+
+    let session = global_session
+        .create_session(&session_desc)
+        .expect("failed to create slang compilation session");
+    let shader = session
+        .load_module_from_source_string("my_shader", path, source)
+        .expect("failed to load slang module");
+
+    let entries: Vec<_> = entry_point_names
+        .iter()
+        .map(|name| {
+            shader
+                .find_entry_point_by_name(name)
+                .expect("entry point not found")
+        })
+        .collect();
+
+    let spec_source = format!(
+        r#"
+        export static const uint PLATE_COUNT = {};
+        "#,
+        PLATE_COUNT,
+    );
+
+    let spec_module = session
+        .load_module_from_source_string("spec_foo_16", "spec_foo_16.slang", &spec_source)
+        .expect("failed to load spec slang module");
+
+    let program = session
+        .create_composite_component_type(&[
+            shader.clone().into(),
+            spec_module.into(),
+            entries[0].clone().into(),
+        ])
+        .expect("failed to create composite slang component (?)");
+
+    let linked = program.link().expect("failed to link slang program");
+
+    let mut bind_group_layout_entries: Vec<wgpu::BindGroupLayoutEntry> = Vec::new();
+
+    for param in linked.layout(0).unwrap().parameters() {
+        assert_eq!(param.binding_space(), 0);
+        let type_layout = param.type_layout().unwrap();
+
+        println!("param = {:?}", param.name().unwrap_or("??"));
+
+        match type_layout.kind() {
+            shader_slang::TypeKind::ConstantBuffer => {
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: param.binding_index(),
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: Some(
+                            NonZeroU64::new(
+                                type_layout
+                                    .element_type_layout()
+                                    .unwrap()
+                                    .size(shader_slang::ParameterCategory::Uniform)
+                                    as u64,
+                            )
+                            .unwrap(),
+                        ),
+                    },
+                    count: None,
+                });
+            }
+            shader_slang::TypeKind::Resource
+                if type_layout.resource_shape().unwrap()
+                    == shader_slang::ResourceShape::SlangStructuredBuffer =>
+            {
+                let el = type_layout.element_type_layout().unwrap();
+                /*println!("cats = ");
+                println!("cat = {:?}", type_layout.parameter_category());
+                println!("elcat = {:?}", el.parameter_category());
+                println!(
+                    "type stride = {:?} {:?}",
+                    type_layout.stride(shader_slang::ParameterCategory::DescriptorTableSlot),
+                    type_layout
+                        .element_stride(shader_slang::ParameterCategory::DescriptorTableSlot)
+                );
+                println!(
+                    "el stride = {:?} {:?}",
+                    el.stride(shader_slang::ParameterCategory::Uniform),
+                    el.element_stride(shader_slang::ParameterCategory::Uniform)
+                );*/
+
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: param.binding_index(),
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage {
+                            read_only: match type_layout.resource_access().unwrap() {
+                                shader_slang::ResourceAccess::None
+                                | shader_slang::ResourceAccess::Read => true,
+                                shader_slang::ResourceAccess::Write
+                                | shader_slang::ResourceAccess::ReadWrite => false,
+                                _ => todo!(),
+                            },
+                        },
+                        has_dynamic_offset: false,
+                        // the stride / Uniform thing makes no sense to me
+                        min_binding_size: Some(
+                            NonZeroU64::new(
+                                el.stride(shader_slang::ParameterCategory::Uniform) as u64
+                            )
+                            .unwrap(),
+                        ),
+                    },
+                    count: None,
+                });
+            }
+            kind => todo!("type param kind: {kind:?}"),
+        }
+    }
+
+    for ep in linked.layout(0).unwrap().entry_points() {
+        println!("thread count = {:?}", ep.compute_thread_group_size());
+        println!("EP name = {:?}", ep.name());
+    }
+
+    let bind_group_layout = gpu
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &bind_group_layout_entries,
+        });
+
+    let spirv_blob = linked
+        .entry_point_code(0, 0)
+        .expect("failed to get spirv blob");
+    let spirv: &[u8] = spirv_blob.as_slice();
+
+    //println!("src = {:?}", wgpu::util::make_spirv(spirv));
+    std::fs::write("dump.spv", &spirv).expect("!!");
+    let source = wgpu::ShaderModuleDescriptor {
+        source: wgpu::util::make_spirv(spirv),
+        label: None,
+    };
+    //let source = include_spirv!(concat!(env!("OUT_DIR"), "/", "shader.slang.spv"));
+
+    let module = if true {
+        unsafe {
+            gpu.device.create_shader_module_passthrough(
+                wgpu::wgt::CreateShaderModuleDescriptorPassthrough {
+                    label: None,
+                    entry_points: Cow::Owned(
+                        linked
+                            .layout(0)
+                            .unwrap()
+                            .entry_points()
+                            .map(|ep| {
+                                let wg_size = ep.compute_thread_group_size();
+                                wgpu::PassthroughShaderEntryPoint {
+                                    name: ep.name().unwrap().into(),
+                                    workgroup_size: (
+                                        wg_size[0] as u32,
+                                        wg_size[1] as u32,
+                                        wg_size[2] as u32,
+                                    ),
+                                }
+                            })
+                            .collect(),
+                    ),
+                    spirv: Some(Cow::Borrowed(bytemuck::pod_align_to(spirv).1)),
+                    dxil: None,
+                    hlsl: None,
+                    metallib: None,
+                    msl: None,
+                    glsl: None,
+                    wgsl: None,
+                },
+            )
+        }
+    } else {
+        gpu.device.create_shader_module(source)
+    };
+
+    let pipeline_layout = gpu
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+    let bind_group_layouts = vec![bind_group_layout];
+
+    let pipelines: HashMap<String, wgpu::ComputePipeline> = entry_point_names
+        .iter()
+        .copied()
+        .map(|entry| {
+            let pipe = gpu
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: None,
+                    layout: Some(&pipeline_layout),
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+            (entry.to_owned(), pipe)
+        })
+        .collect();
+
+    Shaders {
+        pipeline_layout,
+        pipelines,
+        bind_group_layouts,
+    }
+
+    //println!("spirv = {spirv:?}");
+}
+
+const WORKGROUP_COUNT: u32 = 4 * 16 * 16; //128 * 256;
 
 fn main_gpu() {
     env_logger::init();
@@ -308,160 +591,214 @@ fn main_gpu() {
         seed,
         pad: [0; 3],
     };
-
-    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-    desc.backends = Backends::VULKAN;
-    let instance = wgpu::Instance::new(desc);
-
-    let adapter =
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-            .expect("Failed to create adapter");
-
-    println!("Running on Adapter: {:#?}", adapter.get_info());
-
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: None,
-        required_features: wgpu::Features::SUBGROUP,
-        required_limits: wgpu::Limits::defaults(),
-        experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        memory_hints: wgpu::MemoryHints::MemoryUsage,
-        trace: wgpu::Trace::Off,
-    }))
-    .expect("Failed to create device");
-
-    //let module = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-    let module = device.create_shader_module(include_spirv!(concat!(
-        env!("OUT_DIR"),
-        "/",
-        "shader.slang.spv"
-    )));
-
-    let consts_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: None,
-        contents: bytemuck::bytes_of(&consts),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-
-    let output_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: (PLATE_COUNT * size_of::<f32>() * (WORKGROUP_COUNT as usize)) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-
-    let download_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: output_data_buffer.size(),
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: None,
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: Some(NonZeroU64::new(size_of::<Consts>() as u64).unwrap()),
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    min_binding_size: Some(NonZeroU64::new(4).unwrap()),
-                    has_dynamic_offset: false,
-                },
-                count: None,
-            },
-        ],
-    });
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: None,
-        bind_group_layouts: &[Some(&bind_group_layout)],
-        immediate_size: 0,
-    });
-
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: None,
-        layout: Some(&pipeline_layout),
-        module: &module,
-        entry_point: Some("sample_walk"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: None,
-    });
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: consts_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: output_data_buffer.as_entire_binding(),
-            },
-        ],
-    });
-
-    println!("begin record");
-    let mut cmd_buff =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-    let mut compute_pass = cmd_buff.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: None,
-    });
-
-    compute_pass.set_pipeline(&pipeline);
-    compute_pass.set_bind_group(0, &bind_group, &[]);
-
-    compute_pass.dispatch_workgroups(WORKGROUP_COUNT, 1, 1);
-
-    drop(compute_pass);
-
-    cmd_buff.copy_buffer_to_buffer(
-        &output_data_buffer,
-        0,
-        &download_buffer,
-        0,
-        output_data_buffer.size(),
+    let gpu = init_gpu();
+    let shaders = compile_shaders(
+        &gpu,
+        "shader.slang",
+        include_str!("shader.slang"),
+        &["sample_walk"],
     );
+    println!("shaders = {shaders:?}");
 
-    let cmd_buff = cmd_buff.finish();
-    println!("submit !");
-    queue.submit([cmd_buff]);
-    println!("submited !");
+    let const_buffer = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&consts),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
 
-    let buffer_slice = download_buffer.slice(..);
-    buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+    struct Submission {
+        index: Option<wgpu::SubmissionIndex>,
+        output_buffer: wgpu::Buffer,
+        copy_buffer: wgpu::Buffer,
 
-    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        query_buffer: wgpu::Buffer,
+        query_copy_buffer: wgpu::Buffer,
+        query_set: wgpu::QuerySet,
+    }
+    const QUERY_COUNT: usize = 2;
+    fn allocate_submission(gpu: &Gpu) -> Submission {
+        let output_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (PLATE_COUNT * size_of::<f32>() * (WORKGROUP_COUNT as usize)) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
 
-    let data = buffer_slice.get_mapped_range().unwrap();
-    let result: Vec<f32> = bytemuck::allocation::pod_collect_to_vec(&data);
+        let copy_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: output_buffer.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
 
-    println!("Result: {result:?}");
+        let query_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (QUERY_COUNT * size_of::<u64>()) as u64,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
 
-    let mut mean = vec![0.0; PLATE_COUNT];
-    for i in 0..WORKGROUP_COUNT as usize {
-        for k in 0..PLATE_COUNT {
-            mean[k] += result[PLATE_COUNT * i + k];
+        let query_copy_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (QUERY_COUNT * size_of::<u64>()) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let query_set = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: None,
+            ty: wgpu::QueryType::Timestamp,
+            count: QUERY_COUNT as u32,
+        });
+
+        Submission {
+            index: None,
+            output_buffer,
+            copy_buffer,
+            query_buffer,
+            query_copy_buffer,
+            query_set,
         }
     }
-    for m in &mut mean {
-        *m /= (WORKGROUP_COUNT as f32);
-        *m *= 1e12;
+
+    let mut submission = allocate_submission(&gpu);
+
+    fn submit(
+        gpu: &Gpu,
+        shaders: &Shaders,
+        const_buffer: &wgpu::Buffer,
+        submission: &mut Submission,
+    ) {
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &shaders.bind_group_layouts[0],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: const_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: submission.output_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut cmd_buff = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        cmd_buff.write_timestamp(&submission.query_set, 0);
+        let mut compute_pass = cmd_buff.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+
+        compute_pass.set_pipeline(shaders.pipelines.get("sample_walk").unwrap());
+        compute_pass.set_bind_group(0, &bind_group, &[]);
+
+        compute_pass.dispatch_workgroups(WORKGROUP_COUNT, 1, 1);
+
+        drop(compute_pass);
+        cmd_buff.write_timestamp(&submission.query_set, 1);
+
+        cmd_buff.copy_buffer_to_buffer(
+            &submission.output_buffer,
+            0,
+            &submission.copy_buffer,
+            0,
+            submission.output_buffer.size(),
+        );
+
+        cmd_buff.resolve_query_set(
+            &submission.query_set,
+            0..QUERY_COUNT as u32,
+            &submission.query_buffer,
+            0,
+        );
+        cmd_buff.copy_buffer_to_buffer(
+            &submission.query_buffer,
+            0,
+            &submission.query_copy_buffer,
+            0,
+            submission.query_buffer.size(),
+        );
+
+        let cmd_buff = cmd_buff.finish();
+        let submission_index = gpu.queue.submit([cmd_buff]);
+        println!("submitted : {submission_index:?}");
+        assert!(submission.index.is_none());
+        submission.index = Some(submission_index);
     }
-    println!("mean = {mean:?}");
+
+    submit(&gpu, &shaders, &const_buffer, &mut submission);
+
+    gpu.device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission.index.unwrap()),
+            timeout: None, //Some(Duration::ZERO),
+        })
+        .expect("failed to poll");
+    println!("submission done !");
+    println!("map async ...");
+    submission
+        .copy_buffer
+        .map_async(wgpu::MapMode::Read, .., |_| {});
+    submission
+        .query_copy_buffer
+        .map_async(wgpu::MapMode::Read, .., |_| {});
+    gpu.device.poll(wgpu::PollType::Poll).unwrap();
+    let buffer_map = submission.copy_buffer.get_mapped_range(..).unwrap();
+    let buffer_data: &[u8] = &buffer_map;
+    /*println!(
+        "buffer map data = {:?}",
+        bytemuck::allocation::pod_collect_to_vec::<u8, f32>(buffer_data)
+    );*/
+    let query_buffer_map = submission.query_copy_buffer.get_mapped_range(..).unwrap();
+    let query_values = bytemuck::allocation::pod_collect_to_vec::<u8, u64>(&query_buffer_map);
+    println!("qv = {query_values:?}");
+    let dt = (((query_values[1] - query_values[0]) as f64)
+        * (gpu.queue.get_timestamp_period() as f64))
+        * 1e-9;
+    println!("delta = {:.2} ms", dt * 1e3);
+    let wg_size = 64 * 4;
+    let n_samples = wg_size * WORKGROUP_COUNT;
+    let samples_per_sec = (n_samples as f64) / dt;
+    println!("n walks = {:.2} Ms/sec", samples_per_sec / 1e6);
+    println!(
+        "avg wave time = {:.2} us",
+        dt / (WORKGROUP_COUNT * wg_size / 64) as f64 * 1e6
+    );
+
+    #[cfg(false)]
+    {
+        println!("begin record");
+
+        println!("submited !");
+
+        let buffer_slice = download_buffer.slice(..);
+        buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        let data = buffer_slice.get_mapped_range().unwrap();
+        let result: Vec<f32> = bytemuck::allocation::pod_collect_to_vec(&data);
+
+        println!("Result: {result:?}");
+
+        let mut mean = vec![0.0; PLATE_COUNT];
+        for i in 0..WORKGROUP_COUNT as usize {
+            for k in 0..PLATE_COUNT {
+                mean[k] += result[PLATE_COUNT * i + k];
+            }
+        }
+        for m in &mut mean {
+            *m /= (WORKGROUP_COUNT as f32);
+            *m *= 1e12;
+        }
+        println!("mean = {mean:?}");
+    }
 }
 
 fn main() {
