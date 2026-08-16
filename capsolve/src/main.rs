@@ -1,3 +1,4 @@
+#![feature(vec_into_chunks)]
 use bytemuck::{NoUninit, Pod, Zeroable};
 use std::{
     borrow::Cow, collections::HashMap, f32::consts::PI, num::NonZeroU64, str::FromStr,
@@ -740,8 +741,7 @@ fn main_gpu() {
             timeout: None, //Some(Duration::ZERO),
         })
         .expect("failed to poll");
-    println!("submission done !");
-    println!("map async ...");
+
     submission
         .copy_buffer
         .map_async(wgpu::MapMode::Read, .., |_| {});
@@ -750,11 +750,18 @@ fn main_gpu() {
         .map_async(wgpu::MapMode::Read, .., |_| {});
     gpu.device.poll(wgpu::PollType::Poll).unwrap();
     let buffer_map = submission.copy_buffer.get_mapped_range(..).unwrap();
-    let buffer_data: &[u8] = &buffer_map;
-    /*println!(
-        "buffer map data = {:?}",
-        bytemuck::allocation::pod_collect_to_vec::<u8, f32>(buffer_data)
-    );*/
+    let result = bytemuck::allocation::pod_collect_to_vec::<u8, f32>(&buffer_map)
+        .into_chunks::<PLATE_COUNT>();
+    let mut mean = [0.0; PLATE_COUNT];
+    for r in &result {
+        for i in 0..PLATE_COUNT {
+            mean[i] += r[i] / (result.len() as f32);
+        }
+    }
+    for i in 0..PLATE_COUNT {
+        mean[i] *= 1e12;
+    }
+    println!("mean pF = {:?}", mean);
     let query_buffer_map = submission.query_copy_buffer.get_mapped_range(..).unwrap();
     let query_values = bytemuck::allocation::pod_collect_to_vec::<u8, u64>(&query_buffer_map);
     println!("qv = {query_values:?}");
@@ -762,7 +769,7 @@ fn main_gpu() {
         * (gpu.queue.get_timestamp_period() as f64))
         * 1e-9;
     println!("delta = {:.2} ms", dt * 1e3);
-    let wg_size = 64 * 4;
+    let wg_size = 64;
     let n_samples = wg_size * WORKGROUP_COUNT;
     let samples_per_sec = (n_samples as f64) / dt;
     println!("n walks = {:.2} Ms/sec", samples_per_sec / 1e6);
