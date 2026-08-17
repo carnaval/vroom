@@ -1,0 +1,2 @@
+[env]
+SLANG_DIR = { value = "C:\\code\\slang-2026.14.1-windows-x86_64", force = true }
