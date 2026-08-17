@@ -6,7 +6,7 @@ use std::{
     f32::consts::PI,
     num::NonZeroU64,
     str::FromStr,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use wgpu::{
     Backends, InstanceFlags, include_spirv, include_spirv_raw, util::DeviceExt,
@@ -83,15 +83,33 @@ struct PlateInfo {
 
 #[derive(Pod, Clone, Copy, Zeroable, Debug)]
 #[repr(C)]
-struct SampleResult {
-    sample_count: u64,
+struct GpuSampleResult {
+    sample_count: u32,
     mean: [f32; PLATE_COUNT],
     m2: [f32; PLATE_COUNT],
     max_walk_steps: u32,
-    padding: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SampleResult {
+    sample_count: u64,
+    mean: [f64; PLATE_COUNT],
+    m2: [f64; PLATE_COUNT],
+    max_walk_steps: u32,
 }
 
 const PLATE_COUNT: usize = 2;
+
+impl GpuSampleResult {
+    fn as_sample_result(&self) -> SampleResult {
+        SampleResult {
+            sample_count: self.sample_count as u64,
+            mean: self.mean.map(|v| v as f64),
+            m2: self.m2.map(|v| v as f64),
+            max_walk_steps: self.max_walk_steps,
+        }
+    }
+}
 
 impl SampleResult {
     const ZERO: SampleResult = SampleResult {
@@ -99,7 +117,6 @@ impl SampleResult {
         mean: [0.0; PLATE_COUNT],
         m2: [0.0; PLATE_COUNT],
         max_walk_steps: 0,
-        padding: 0,
     };
     fn merge(&mut self, other: &SampleResult) {
         if other.sample_count == 0 {
@@ -109,9 +126,9 @@ impl SampleResult {
             *self = *other;
         }
         let total_count = self.sample_count + other.sample_count;
-        let count_ratio = (other.sample_count as f32) / (self.sample_count as f32);
+        let count_ratio = (other.sample_count as f64) / (self.sample_count as f64);
         let m2_ratio =
-            (self.sample_count as f32) * (other.sample_count as f32) / (total_count as f32);
+            (self.sample_count as f64) * (other.sample_count as f64) / (total_count as f64);
         for i in 0..PLATE_COUNT {
             let delta = other.mean[i] - self.mean[i];
             self.mean[i] += delta * count_ratio;
@@ -120,10 +137,28 @@ impl SampleResult {
         self.sample_count = total_count;
         self.max_walk_steps = u32::max(self.max_walk_steps, other.max_walk_steps);
     }
-    fn merge_all<'a>(samples: impl Iterator<Item = &'a Self>) -> Self {
+    fn merge_all(samples: impl Iterator<Item = Self>) -> Self {
         let mut result = Self::ZERO;
-        samples.for_each(|s| result.merge(s));
+        samples.for_each(|s| result.merge(&s));
         result
+    }
+    fn print(&self, mult: f64, unit: &str) {
+        println!(
+            "Estimate after {:.2} Gsp:",
+            (self.sample_count as f64) * 1e-9
+        );
+        if self.sample_count >= 2 {
+            for i in 0..PLATE_COUNT {
+                let s = f64::sqrt(self.m2[i] / ((self.sample_count - 1) as f64));
+                let std_err = s / f64::sqrt(self.sample_count as f64);
+                let interval_95 = std_err * 1.96;
+                println!(
+                    " [{i}] {:.6} {unit} ± {:.6} {unit}",
+                    self.mean[i] / mult,
+                    interval_95 / mult
+                );
+            }
+        }
     }
 }
 
@@ -238,7 +273,7 @@ fn main_cpu() {
 
     const EPSILON_ZERO: f32 = 8.8541878188e-12;
 
-    const SURFACE_TOL: f32 = 1e-6;
+    const SURFACE_TOL: f32 = 1e-8;
 
     let epsilon = EPSILON_ZERO;
 
@@ -273,7 +308,8 @@ fn main_cpu() {
     let mut result = vec![0.0f64; 2];
 
     let mut sample_count = 0;
-
+    // eps = 1e-6
+    // total estiamte = SampleResult { sample_count: 126502712000, mean: [8.08914006384203e-12, -5.66188745776894e-12], m2: [7.729817101435693e-11, 5.7341467664039366e-11], max_walk_steps: 628 }
     for _ in 0..100000000 {
         let g = sample_box_surface(&mut rng, g1.0, g1.1);
 
@@ -682,6 +718,8 @@ fn main_gpu() {
 
     let mut rng = Rng::new();
 
+    // 87728520000, mean: [8.0891650846068e-12, -5.661894577326567e-12], m2: [5.3605302694541554e-11
+
     let consts = Consts {
         plates: [p1.into_plate_info(), p2.into_plate_info()],
     };
@@ -835,7 +873,7 @@ fn main_gpu() {
 
         let cmd_buff = cmd_buff.finish();
         let submission_index = gpu.queue.submit([cmd_buff]);
-        println!("submitted : {submission_index:?}");
+        //println!("submitted : {submission_index:?}");
         assert!(submission.index.is_none());
         submission.index = Some(submission_index);
     }
@@ -849,6 +887,8 @@ fn main_gpu() {
 
     let mut total_estimate = SampleResult::ZERO;
 
+    let t0 = Instant::now();
+    let mut last_print: Option<Instant> = None;
     loop {
         while let Some(mut s) = pending_submissions.pop_front_if(|s| {
             match gpu.device.poll(wgpu::PollType::Wait {
@@ -878,11 +918,23 @@ fn main_gpu() {
             {
                 let buffer_map = submission.copy_buffer.get_mapped_range(..).unwrap();
                 let result =
-                    bytemuck::allocation::pod_collect_to_vec::<u8, SampleResult>(&buffer_map);
-                let result = SampleResult::merge_all(result.iter());
-                println!("mean pF = {:?}", result);
+                    bytemuck::allocation::pod_collect_to_vec::<u8, GpuSampleResult>(&buffer_map);
+                let result = SampleResult::merge_all(result.iter().map(|v| v.as_sample_result()));
+                //println!("mean pF = {:?}", result);
                 total_estimate.merge(&result);
-                println!("total estiamte = {:?}", total_estimate);
+                //println!("total estiamte = {:?}", total_estimate);
+                if last_print
+                    .map(|t| t.elapsed().as_secs_f32() >= 0.15)
+                    .unwrap_or(true)
+                {
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    println!(
+                        "Throughput: {:.2} Ms/s (cpu)",
+                        ((total_estimate.sample_count as f64) / elapsed) * 1e-6
+                    );
+                    total_estimate.print(1e-12, "pF");
+                    last_print = Some(Instant::now());
+                }
                 if TIMING_QUERIES {
                     let query_buffer_map =
                         submission.query_copy_buffer.get_mapped_range(..).unwrap();

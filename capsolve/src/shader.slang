@@ -162,7 +162,7 @@ static const f32 EPSILON_ZERO = 8.8541878188e-12;
 
 static const u32 INVALID = 0xffffffff;
 
-static const f32 SURFACE_TOL = 1e-6;
+static const f32 SURFACE_TOL = 1e-8;
 
 f32x3 sample_conditional_return_on_sphere(f32x3 x, f32x3 center, f32 a, f32x2 rand) {
     f32x3 v = x - center;
@@ -244,11 +244,9 @@ struct StartPoint {
 
 struct SampleResult {
     u32 sample_count;
-    u32 sample_count_high; // not used on the GPU
     f32 mean[PLATE_COUNT];
     f32 m2[PLATE_COUNT];
     u32 max_walk_steps;
-    u32 padding;
 }
 
 void add_sample_result(inout SampleResult r, f32 values[PLATE_COUNT], u32 walk_steps) {
@@ -265,7 +263,6 @@ void add_sample_result(inout SampleResult r, f32 values[PLATE_COUNT], u32 walk_s
 SampleResult wave_merge_sample_results(SampleResult local) {
     SampleResult r;
     r.sample_count = WaveActiveSum(local.sample_count);
-    r.sample_count_high = 0;
     if (r.sample_count == 0) { return r; }
     for (u32 i = 0; i < PLATE_COUNT; i++) {
         f32 ref = WaveReadLaneFirst(local.mean[i]);
@@ -302,7 +299,6 @@ void sample_walk(uniform Param param, uint3 global_thread_id: SV_DispatchThreadI
 
     SampleResult local_sample_result;
     local_sample_result.sample_count = 0;
-    local_sample_result.sample_count_high = 0;
     local_sample_result.max_walk_steps = 0;
     for (u32 i = 0; i < PLATE_COUNT; i++) {
         local_sample_result.mean[i] = 0.0;
