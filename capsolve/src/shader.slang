@@ -17,9 +17,9 @@ static const f32 PI = 3.14159265358979323846264338327950288;
 static const f32 DEG_TO_RAD = PI / 180.0;
 
 [vk_binding(0, 0)]
-ConstantBuffer<Consts> consts;
+ConstantBuffer<Consts, CDataLayout> consts;
 [vk_binding(1, 0)]
-RWStructuredBuffer<f32> output;
+RWStructuredBuffer<SampleResult, CDataLayout> output;
 
 struct PlateInfo {
     f32x3 origin;
@@ -343,9 +343,7 @@ void sample_walk(uint3 global_thread_id: SV_DispatchThreadID, uint3 group_thread
     SampleResult wave_sample_result = wave_merge_sample_results(local_sample_result);
 
     if (group_thread_id.x == 0) {
-        for (u32 i = 0; i < PLATE_COUNT; i++) {
-            output[workgroup_id.x * PLATE_COUNT + i] = wave_sample_result.mean[i];
-        }
+        output[workgroup_id.x] = wave_sample_result;
 
 #if 0
         for (u32 i = 0; i < PLATE_COUNT; i++) {

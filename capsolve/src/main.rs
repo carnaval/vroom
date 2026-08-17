@@ -69,19 +69,20 @@ struct Plate {
 #[repr(C, align(16))]
 struct PlateInfo {
     origin: [f32; 3],
-    pad0: f32,
     u: [f32; 3],
-    pad1: f32,
     v: [f32; 3],
-    pad2: f32,
     n: [f32; 3],
-    pad3: f32,
     dim: [f32; 2],
-    pad4: [f32; 2],
     box_min: [f32; 3],
-    pad5: f32,
     box_max: [f32; 3],
-    pad6: f32,
+}
+
+#[derive(Pod, Clone, Copy, Zeroable)]
+#[repr(C)]
+struct SampleResult {
+    sample_count: u32,
+    mean: [f32; PLATE_COUNT],
+    m2: [f32; PLATE_COUNT],
 }
 
 const PLATE_COUNT: usize = 2;
@@ -105,13 +106,6 @@ impl Plate {
             dim: self.dim.to_array(),
             box_min: box_min.to_array(),
             box_max: box_max.to_array(),
-            pad0: 0.0,
-            pad1: 0.0,
-            pad2: 0.0,
-            pad3: 0.0,
-            pad4: [0.0, 0.0],
-            pad5: 0.0,
-            pad6: 0.0,
         }
     }
 
@@ -622,7 +616,7 @@ fn main_gpu() {
     fn allocate_submission(gpu: &Gpu) -> Submission {
         let output_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: (PLATE_COUNT * size_of::<f32>() * (WORKGROUP_COUNT as usize)) as u64,
+            size: (size_of::<SampleResult>() * (WORKGROUP_COUNT as usize)) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -750,12 +744,11 @@ fn main_gpu() {
         .map_async(wgpu::MapMode::Read, .., |_| {});
     gpu.device.poll(wgpu::PollType::Poll).unwrap();
     let buffer_map = submission.copy_buffer.get_mapped_range(..).unwrap();
-    let result = bytemuck::allocation::pod_collect_to_vec::<u8, f32>(&buffer_map)
-        .into_chunks::<PLATE_COUNT>();
+    let result = bytemuck::allocation::pod_collect_to_vec::<u8, SampleResult>(&buffer_map);
     let mut mean = [0.0; PLATE_COUNT];
     for r in &result {
         for i in 0..PLATE_COUNT {
-            mean[i] += r[i] / (result.len() as f32);
+            mean[i] += r.mean[i] / (result.len() as f32);
         }
     }
     for i in 0..PLATE_COUNT {
