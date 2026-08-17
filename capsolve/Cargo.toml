@@ -16,3 +16,4 @@ shader-slang = {
 }
 wgpu = {version="30.0.0", features=["spirv"]}
 ash = "0.38"
+winit = "0.30.13"

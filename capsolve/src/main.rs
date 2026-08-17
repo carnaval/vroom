@@ -9,12 +9,13 @@ use std::{
     time::{Duration, Instant},
 };
 use wgpu::{
-    Backends, InstanceFlags, include_spirv, include_spirv_raw, util::DeviceExt,
-    wgc::SubmissionIndex,
+    Backends, InstanceFlags, include_spirv, include_spirv_raw, rwh::HasWindowHandle,
+    util::DeviceExt, wgc::SubmissionIndex,
 };
+use winit::platform::{pump_events::EventLoopExtPumpEvents as _, windows::WindowExtWindows};
 
 use fastrand::Rng;
-use glam::{Vec2, Vec3, vec2, vec3};
+use glam::{IVec2, Vec2, Vec3, ivec2, vec2, vec3};
 
 struct SurfaceSample {
     position: Vec3,
@@ -345,11 +346,19 @@ fn main_cpu() {
     }
 }
 
+struct GpuView {
+    //window: winit::window::Window,
+    surface: wgpu::Surface<'static>,
+    surface_format: wgpu::TextureFormat,
+    dim: IVec2,
+}
+
 struct Gpu {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    view: Option<GpuView>,
 }
 
 fn request_device_2(
@@ -411,6 +420,59 @@ fn request_device_2(
     (device, queue)
 }
 
+fn init_gpu_view(gpu: &mut Gpu, dim: IVec2, event_loop: &mut winit::event_loop::EventLoop<()>) {
+    let mut window = None;
+    while window.is_none() {
+        #[allow(deprecated)]
+        event_loop.pump_events(Some(Duration::ZERO), |event, event_loop| {
+            if let winit::event::Event::Resumed = event {
+                if window.is_none() {
+                    window = Some(
+                        event_loop
+                            .create_window(
+                                winit::window::WindowAttributes::default()
+                                    .with_inner_size(winit::dpi::PhysicalSize::new(dim.x, dim.y)),
+                            )
+                            .expect("failed to create window"),
+                    );
+                }
+            }
+        });
+    }
+    let window = window.unwrap();
+
+    let size = window.inner_size();
+
+    let surface = gpu
+        .instance
+        .create_surface(window)
+        .expect("failed to create surface");
+
+    //let caps = surface.get_capabilities(&gpu.adapter);
+    let surface_format = wgpu::TextureFormat::Rgba8Unorm;
+
+    surface.configure(
+        &gpu.device,
+        &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::STORAGE_BINDING,
+            format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+        },
+    );
+
+    gpu.view = Some(GpuView {
+        surface,
+        surface_format,
+        dim,
+    });
+}
+
 fn init_gpu() -> Gpu {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = Backends::VULKAN;
@@ -445,6 +507,7 @@ fn init_gpu() -> Gpu {
         adapter,
         device,
         queue,
+        view: None,
     }
 }
 
@@ -462,12 +525,13 @@ fn compile_shaders<Param>(
     //bind_group_layout: wgpu::BindGroupLayout,
     entry_point_names: &[&str],
 ) -> Shaders {
+    let common = include_str!("common.slang");
     let global_session = shader_slang::GlobalSession::new().unwrap();
     println!("tag = {:?}", global_session.build_tag_string());
     let target = shader_slang::TargetDesc::default()
         .format(shader_slang::CompileTarget::Spirv)
         .profile(global_session.find_profile("spirv_1_5"));
-
+    let source = format!("{}\n{}", common, source);
     let targets = [target];
 
     let options = shader_slang::CompilerOptions::default()
@@ -482,7 +546,7 @@ fn compile_shaders<Param>(
         .create_session(&session_desc)
         .expect("failed to create slang compilation session");
     let shader = session
-        .load_module_from_source_string("my_shader", path, source)
+        .load_module_from_source_string("my_shader", path, &source)
         .expect("failed to load slang module");
 
     let entries: Vec<_> = entry_point_names
@@ -545,6 +609,7 @@ fn compile_shaders<Param>(
                     count: None,
                 });
             }
+
             shader_slang::TypeKind::Resource
                 if type_layout.resource_shape().unwrap()
                     == shader_slang::ResourceShape::SlangStructuredBuffer =>
@@ -590,6 +655,37 @@ fn compile_shaders<Param>(
                     count: None,
                 });
             }
+
+            shader_slang::TypeKind::Resource
+                if type_layout.resource_shape().unwrap()
+                    == shader_slang::ResourceShape::SlangTexture2d =>
+            {
+                match type_layout.resource_access().unwrap() {
+                    shader_slang::ResourceAccess::None | shader_slang::ResourceAccess::Read => true,
+                    shader_slang::ResourceAccess::Write
+                    | shader_slang::ResourceAccess::ReadWrite => false,
+                    _ => todo!(),
+                };
+
+                let format = match param.image_format() {
+                    shader_slang::ImageFormat::SLANGIMAGEFORMATRgba8 => {
+                        wgpu::TextureFormat::Rgba8Unorm
+                    }
+                    fmt => todo!("image format {fmt:?}"),
+                };
+
+                bind_group_layout_entries.push(wgpu::BindGroupLayoutEntry {
+                    binding: param.binding_index(),
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                });
+            }
+
             kind => todo!("type param kind: {kind:?}"),
         }
     }
@@ -723,7 +819,17 @@ fn main_gpu() {
     let consts = Consts {
         plates: [p1.into_plate_info(), p2.into_plate_info()],
     };
-    let gpu = init_gpu();
+    let mut gpu = init_gpu();
+
+    let mut event_loop = winit::event_loop::EventLoop::new().unwrap();
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    init_gpu_view(&mut gpu, ivec2(512, 512), &mut event_loop);
+    let view_shader = compile_shaders::<()>(
+        &gpu,
+        "src/view.slang",
+        include_str!("view.slang"),
+        &["draw"],
+    );
 
     #[derive(Pod, Clone, Copy, Zeroable)]
     #[repr(C)]
@@ -890,6 +996,59 @@ fn main_gpu() {
     let t0 = Instant::now();
     let mut last_print: Option<Instant> = None;
     loop {
+        if let Some(view) = &gpu.view {
+            #[allow(deprecated)]
+            event_loop.pump_events(Some(Duration::ZERO), |event, event_loop| {});
+            let backbuffer = match view.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(surface_texture)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => surface_texture,
+                e => panic!("failed to get backbuffer: {e:?}"),
+            };
+            let backbuffer_view = backbuffer
+                .texture
+                .create_view(&wgpu::wgt::TextureViewDescriptor::default());
+            {
+                let mut cmd_buff = gpu
+                    .device
+                    .create_command_encoder(&wgpu::wgt::CommandEncoderDescriptor { label: None });
+
+                let mut pass = cmd_buff.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+
+                let view_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &view_shader.bind_group_layouts[0],
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &const_buffer,
+                                offset: 0,
+                                size: None,
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&backbuffer_view),
+                        },
+                    ],
+                });
+
+                pass.set_pipeline(view_shader.pipelines.get("draw").unwrap());
+
+                pass.set_bind_group(0, &view_bind_group, &[]);
+
+                pass.dispatch_workgroups((view.dim.x / 8) as u32, (view.dim.y / 8) as u32, 1);
+
+                drop(pass);
+
+                let cmd_buff = cmd_buff.finish();
+                gpu.queue.submit([cmd_buff]);
+            }
+            gpu.queue.present(backbuffer);
+        }
         while let Some(mut s) = pending_submissions.pop_front_if(|s| {
             match gpu.device.poll(wgpu::PollType::Wait {
                 submission_index: Some(s.index.as_ref().unwrap().clone()),
