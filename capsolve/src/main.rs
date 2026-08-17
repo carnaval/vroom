@@ -1,7 +1,11 @@
 #![feature(vec_into_chunks)]
-use bytemuck::{NoUninit, Pod, Zeroable};
+use bytemuck::{NoUninit, Pod, Zeroable, bytes_of};
 use std::{
-    borrow::Cow, collections::HashMap, f32::consts::PI, num::NonZeroU64, str::FromStr,
+    borrow::Cow,
+    collections::{HashMap, VecDeque},
+    f32::consts::PI,
+    num::NonZeroU64,
+    str::FromStr,
     time::Duration,
 };
 use wgpu::{
@@ -77,22 +81,56 @@ struct PlateInfo {
     box_max: [f32; 3],
 }
 
-#[derive(Pod, Clone, Copy, Zeroable)]
+#[derive(Pod, Clone, Copy, Zeroable, Debug)]
 #[repr(C)]
 struct SampleResult {
-    sample_count: u32,
+    sample_count: u64,
     mean: [f32; PLATE_COUNT],
     m2: [f32; PLATE_COUNT],
+    max_walk_steps: u32,
+    padding: u32,
 }
 
 const PLATE_COUNT: usize = 2;
 
+impl SampleResult {
+    const ZERO: SampleResult = SampleResult {
+        sample_count: 0,
+        mean: [0.0; PLATE_COUNT],
+        m2: [0.0; PLATE_COUNT],
+        max_walk_steps: 0,
+        padding: 0,
+    };
+    fn merge(&mut self, other: &SampleResult) {
+        if other.sample_count == 0 {
+            return;
+        }
+        if self.sample_count == 0 {
+            *self = *other;
+        }
+        let total_count = self.sample_count + other.sample_count;
+        let count_ratio = (other.sample_count as f32) / (self.sample_count as f32);
+        let m2_ratio =
+            (self.sample_count as f32) * (other.sample_count as f32) / (total_count as f32);
+        for i in 0..PLATE_COUNT {
+            let delta = other.mean[i] - self.mean[i];
+            self.mean[i] += delta * count_ratio;
+            self.m2[i] += other.m2[i] + (delta * delta) * m2_ratio;
+        }
+        self.sample_count = total_count;
+        self.max_walk_steps = u32::max(self.max_walk_steps, other.max_walk_steps);
+    }
+    fn merge_all<'a>(samples: impl Iterator<Item = &'a Self>) -> Self {
+        let mut result = Self::ZERO;
+        samples.for_each(|s| result.merge(s));
+        result
+    }
+}
+
 #[derive(Pod, Clone, Copy, Zeroable)]
-#[repr(C, align(16))]
+#[repr(C)]
 struct Consts {
     plates: [PlateInfo; PLATE_COUNT],
-    seed: u32,
-    pad: [u32; 3],
 }
 
 impl Plate {
@@ -278,6 +316,65 @@ struct Gpu {
     queue: wgpu::Queue,
 }
 
+fn request_device_2(
+    adapter: &wgpu::Adapter,
+    desc: &wgpu::DeviceDescriptor,
+) -> (wgpu::Device, wgpu::Queue) {
+    let hal_adapter = unsafe {
+        adapter
+            .as_hal::<wgpu::hal::api::Vulkan>()
+            .expect("not using Vulkan backend")
+    };
+
+    let vk_instance = hal_adapter.shared_instance().raw_instance();
+    let physical_device = hal_adapter.raw_physical_device();
+
+    let properties = unsafe { vk_instance.get_physical_device_properties(physical_device) };
+
+    if properties.api_version < ash::vk::API_VERSION_1_3 {
+        panic!("not Vulkan 1.3 (0x{:08x})", properties.api_version);
+    }
+
+    let mut scalar_layout_support = ash::vk::PhysicalDeviceScalarBlockLayoutFeatures::default();
+
+    let mut features2 =
+        ash::vk::PhysicalDeviceFeatures2::default().push_next(&mut scalar_layout_support);
+    unsafe {
+        vk_instance.get_physical_device_features2(physical_device, &mut features2);
+    }
+    if scalar_layout_support.scalar_block_layout != ash::vk::TRUE {
+        panic!("no scalarBlockLayout");
+    }
+
+    let mut scalar_layout_enable =
+        ash::vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
+
+    let hal_device = unsafe {
+        hal_adapter
+            .open_with_callback(
+                desc.required_features,
+                &desc.required_limits,
+                &desc.memory_hints,
+                Some(Box::new(|args| {
+                    let info = std::mem::take(args.create_info);
+
+                    *args.create_info = info.push_next(&mut scalar_layout_enable);
+                })),
+            )
+            .expect("failed to open device")
+    };
+
+    drop(hal_adapter);
+
+    let (device, queue) = unsafe {
+        adapter
+            .create_device_from_hal(hal_device, desc)
+            .expect("failed to create device")
+    };
+
+    (device, queue)
+}
+
 fn init_gpu() -> Gpu {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = Backends::VULKAN;
@@ -289,18 +386,23 @@ fn init_gpu() -> Gpu {
 
     println!("Running on Adapter: {:#?}", adapter.get_info());
 
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    let mut required_limits = wgpu::Limits::defaults();
+    required_limits.max_immediate_size = 128;
+
+    let (device, queue) = /*adapter.request_device*/request_device_2(&adapter, &wgpu::DeviceDescriptor {
         label: None,
         required_features: wgpu::Features::SUBGROUP
             | wgpu::Features::TIMESTAMP_QUERY
             | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-            | wgpu::Features::PASSTHROUGH_SHADERS,
-        required_limits: wgpu::Limits::defaults(),
+            | wgpu::Features::PASSTHROUGH_SHADERS
+            | wgpu::Features::IMMEDIATES,
+        required_limits,
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         memory_hints: wgpu::MemoryHints::MemoryUsage,
         trace: wgpu::Trace::Off,
-    }))
-    .expect("Failed to create device");
+    });
+
+    //let (device, queue) = pollster::block_on(dev).expect("Failed to create device");
 
     Gpu {
         instance,
@@ -317,7 +419,7 @@ struct Shaders {
     bind_group_layouts: Vec<wgpu::BindGroupLayout>,
 }
 
-fn compile_shaders(
+fn compile_shaders<Param>(
     gpu: &Gpu,
     path: &str,
     source: &str,
@@ -523,7 +625,7 @@ fn compile_shaders(
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
+            immediate_size: size_of::<Param>() as u32,
         });
 
     let bind_group_layouts = vec![bind_group_layout];
@@ -579,15 +681,19 @@ fn main_gpu() {
     };
 
     let mut rng = Rng::new();
-    let seed = rng.u32(..);
 
     let consts = Consts {
         plates: [p1.into_plate_info(), p2.into_plate_info()],
-        seed,
-        pad: [0; 3],
     };
     let gpu = init_gpu();
-    let shaders = compile_shaders(
+
+    #[derive(Pod, Clone, Copy, Zeroable)]
+    #[repr(C)]
+    struct Param {
+        seed: u32,
+    }
+
+    let shaders = compile_shaders::<Param>(
         &gpu,
         "shader.slang",
         include_str!("shader.slang"),
@@ -613,6 +719,7 @@ fn main_gpu() {
         query_set: wgpu::QuerySet,
     }
     const QUERY_COUNT: usize = 2;
+    const TIMING_QUERIES: bool = false;
     fn allocate_submission(gpu: &Gpu) -> Submission {
         let output_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -658,13 +765,12 @@ fn main_gpu() {
         }
     }
 
-    let mut submission = allocate_submission(&gpu);
-
     fn submit(
         gpu: &Gpu,
         shaders: &Shaders,
         const_buffer: &wgpu::Buffer,
         submission: &mut Submission,
+        param: &Param,
     ) {
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -684,7 +790,9 @@ fn main_gpu() {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        cmd_buff.write_timestamp(&submission.query_set, 0);
+        if TIMING_QUERIES {
+            cmd_buff.write_timestamp(&submission.query_set, 0);
+        }
         let mut compute_pass = cmd_buff.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
             timestamp_writes: None,
@@ -692,11 +800,14 @@ fn main_gpu() {
 
         compute_pass.set_pipeline(shaders.pipelines.get("sample_walk").unwrap());
         compute_pass.set_bind_group(0, &bind_group, &[]);
+        compute_pass.set_immediates(0, bytes_of(param));
 
         compute_pass.dispatch_workgroups(WORKGROUP_COUNT, 1, 1);
 
         drop(compute_pass);
-        cmd_buff.write_timestamp(&submission.query_set, 1);
+        if TIMING_QUERIES {
+            cmd_buff.write_timestamp(&submission.query_set, 1);
+        }
 
         cmd_buff.copy_buffer_to_buffer(
             &submission.output_buffer,
@@ -706,19 +817,21 @@ fn main_gpu() {
             submission.output_buffer.size(),
         );
 
-        cmd_buff.resolve_query_set(
-            &submission.query_set,
-            0..QUERY_COUNT as u32,
-            &submission.query_buffer,
-            0,
-        );
-        cmd_buff.copy_buffer_to_buffer(
-            &submission.query_buffer,
-            0,
-            &submission.query_copy_buffer,
-            0,
-            submission.query_buffer.size(),
-        );
+        if TIMING_QUERIES {
+            cmd_buff.resolve_query_set(
+                &submission.query_set,
+                0..QUERY_COUNT as u32,
+                &submission.query_buffer,
+                0,
+            );
+            cmd_buff.copy_buffer_to_buffer(
+                &submission.query_buffer,
+                0,
+                &submission.query_copy_buffer,
+                0,
+                submission.query_buffer.size(),
+            );
+        }
 
         let cmd_buff = cmd_buff.finish();
         let submission_index = gpu.queue.submit([cmd_buff]);
@@ -727,49 +840,82 @@ fn main_gpu() {
         submission.index = Some(submission_index);
     }
 
-    submit(&gpu, &shaders, &const_buffer, &mut submission);
+    let mut pending_submissions: VecDeque<Submission> = VecDeque::new();
+    let mut available_submissions: VecDeque<Submission> = VecDeque::new();
 
-    gpu.device
-        .poll(wgpu::PollType::Wait {
-            submission_index: Some(submission.index.unwrap()),
-            timeout: None, //Some(Duration::ZERO),
-        })
-        .expect("failed to poll");
+    for _ in 0..40 {
+        available_submissions.push_back(allocate_submission(&gpu));
+    }
 
-    submission
-        .copy_buffer
-        .map_async(wgpu::MapMode::Read, .., |_| {});
-    submission
-        .query_copy_buffer
-        .map_async(wgpu::MapMode::Read, .., |_| {});
-    gpu.device.poll(wgpu::PollType::Poll).unwrap();
-    let buffer_map = submission.copy_buffer.get_mapped_range(..).unwrap();
-    let result = bytemuck::allocation::pod_collect_to_vec::<u8, SampleResult>(&buffer_map);
-    let mut mean = [0.0; PLATE_COUNT];
-    for r in &result {
-        for i in 0..PLATE_COUNT {
-            mean[i] += r.mean[i] / (result.len() as f32);
+    let mut total_estimate = SampleResult::ZERO;
+
+    loop {
+        while let Some(mut s) = pending_submissions.pop_front_if(|s| {
+            match gpu.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(s.index.as_ref().unwrap().clone()),
+                timeout: Some(Duration::ZERO),
+            }) {
+                Ok(_) => true,
+                Err(wgpu::PollError::Timeout) => false,
+                Err(e) => panic!("failed to poll device: {e:?}"),
+            }
+        }) {
+            s.index = None;
+            available_submissions.push_back(s);
+        }
+
+        // retire available
+        for submission in &available_submissions {
+            submission
+                .copy_buffer
+                .map_async(wgpu::MapMode::Read, .., |_| {});
+            if TIMING_QUERIES {
+                submission
+                    .query_copy_buffer
+                    .map_async(wgpu::MapMode::Read, .., |_| {});
+            }
+            gpu.device.poll(wgpu::PollType::Poll).unwrap();
+            {
+                let buffer_map = submission.copy_buffer.get_mapped_range(..).unwrap();
+                let result =
+                    bytemuck::allocation::pod_collect_to_vec::<u8, SampleResult>(&buffer_map);
+                let result = SampleResult::merge_all(result.iter());
+                println!("mean pF = {:?}", result);
+                total_estimate.merge(&result);
+                println!("total estiamte = {:?}", total_estimate);
+                if TIMING_QUERIES {
+                    let query_buffer_map =
+                        submission.query_copy_buffer.get_mapped_range(..).unwrap();
+                    let query_values =
+                        bytemuck::allocation::pod_collect_to_vec::<u8, u64>(&query_buffer_map);
+                    let dt = (((query_values[1] - query_values[0]) as f64)
+                        * (gpu.queue.get_timestamp_period() as f64))
+                        * 1e-9;
+                    println!("delta = {:.2} ms", dt * 1e3);
+
+                    let wg_size = 64;
+                    let n_samples = wg_size * WORKGROUP_COUNT;
+                    let samples_per_sec = (n_samples as f64) / dt;
+                    println!("n walks = {:.2} Ms/sec", samples_per_sec / 1e6);
+                    println!(
+                        "avg wave time = {:.2} us",
+                        dt / (WORKGROUP_COUNT * wg_size / 64) as f64 * 1e6
+                    );
+                }
+            }
+            submission.copy_buffer.unmap();
+            if TIMING_QUERIES {
+                submission.query_copy_buffer.unmap();
+            }
+        }
+
+        // submit
+        while let Some(mut submission) = available_submissions.pop_front() {
+            let param = Param { seed: rng.u32(..) };
+            submit(&gpu, &shaders, &const_buffer, &mut submission, &param);
+            pending_submissions.push_back(submission);
         }
     }
-    for i in 0..PLATE_COUNT {
-        mean[i] *= 1e12;
-    }
-    println!("mean pF = {:?}", mean);
-    let query_buffer_map = submission.query_copy_buffer.get_mapped_range(..).unwrap();
-    let query_values = bytemuck::allocation::pod_collect_to_vec::<u8, u64>(&query_buffer_map);
-    println!("qv = {query_values:?}");
-    let dt = (((query_values[1] - query_values[0]) as f64)
-        * (gpu.queue.get_timestamp_period() as f64))
-        * 1e-9;
-    println!("delta = {:.2} ms", dt * 1e3);
-    let wg_size = 64;
-    let n_samples = wg_size * WORKGROUP_COUNT;
-    let samples_per_sec = (n_samples as f64) / dt;
-    println!("n walks = {:.2} Ms/sec", samples_per_sec / 1e6);
-    println!(
-        "avg wave time = {:.2} us",
-        dt / (WORKGROUP_COUNT * wg_size / 64) as f64 * 1e6
-    );
 
     #[cfg(false)]
     {

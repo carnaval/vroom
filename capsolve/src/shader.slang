@@ -40,7 +40,6 @@ extern static const u32 PLATE_COUNT;
 
 struct Consts {
     PlateInfo plates[PLATE_COUNT];
-    u32 seed;
 }
 
 
@@ -188,20 +187,20 @@ f32x3 sample_conditional_return_on_sphere(f32x3 x, f32x3 center, f32 a, f32x2 ra
 
 groupshared f32 op_count;
 groupshared f32 op_wave_pct;
-u32 walk_on_sphere(uint4 seed, f32x3 sp, bool DEBUG, uint thread_id) {
+u32 walk_on_sphere(uint4 seed, f32x3 sp, bool DEBUG, uint thread_id, inout uint walk_steps) {
     f32 outside_radius = 0.25;
-    i32 step_count = 0;
+    u32 step_count = 0;
     op_count = 0;
     op_wave_pct = 0;
     //for (i32 it = 0; it < 3000; it++) {
     while (true) {
         if (DEBUG) {
-            uint4 ballot = WaveActiveBallot(true);
-            uint64_t wave_mask = (uint64_t)ballot.x | ((uint64_t)ballot.y << 32);
+            uint4 wave_mask = WaveActiveBallot(true);
             if (WaveIsFirstLane()) {
                 op_count += 1.0;
-                op_wave_pct += ((f32)countbits(wave_mask)) / 64.0;
-                printf("[%u]    it = %u, lanes = %u, mask = %ullx\n", thread_id, step_count, countbits(wave_mask), wave_mask);
+                u32 lane_count = countbits(wave_mask.x) + countbits(wave_mask.y);
+                op_wave_pct += ((f32)lane_count) / 64.0;
+                printf("[%u]    it = %u, lanes = %u\n", thread_id, step_count, lane_count);
             }
         }
         f32 sp_d2 = dot(sp,sp);
@@ -229,15 +228,14 @@ u32 walk_on_sphere(uint4 seed, f32x3 sp, bool DEBUG, uint thread_id) {
         let d = sqrt(cp.sqdist);
         let r = 0.999999 * d;
         sp += r * random_dir(seed);
-        seed.w += 10;
+        seed.w += 10; // TODO !!! correlatedd if 1, clean that up
         step_count += 1;
+        walk_steps += 1;
     }
     return INVALID;
 }
 
 static const u32 WORKGROUP_SIZE = 64;
-
-groupshared f32 shared_result[WORKGROUP_SIZE * PLATE_COUNT];
 
 struct StartPoint {
     f32x3 x;
@@ -246,11 +244,14 @@ struct StartPoint {
 
 struct SampleResult {
     u32 sample_count;
+    u32 sample_count_high; // not used on the GPU
     f32 mean[PLATE_COUNT];
     f32 m2[PLATE_COUNT];
+    u32 max_walk_steps;
+    u32 padding;
 }
 
-void add_sample_result(inout SampleResult r, f32 values[PLATE_COUNT]) {
+void add_sample_result(inout SampleResult r, f32 values[PLATE_COUNT], u32 walk_steps) {
     r.sample_count += 1;
     for (u32 i = 0; i < PLATE_COUNT; i++) {
         f32 delta = values[i] - r.mean[i];
@@ -258,11 +259,13 @@ void add_sample_result(inout SampleResult r, f32 values[PLATE_COUNT]) {
         f32 delta2 = values[i] - r.mean[i];
         r.m2[i] += delta*delta2;
     }
+    r.max_walk_steps = max(r.max_walk_steps, walk_steps);
 }
 
 SampleResult wave_merge_sample_results(SampleResult local) {
     SampleResult r;
     r.sample_count = WaveActiveSum(local.sample_count);
+    r.sample_count_high = 0;
     if (r.sample_count == 0) { return r; }
     for (u32 i = 0; i < PLATE_COUNT; i++) {
         f32 ref = WaveReadLaneFirst(local.mean[i]);
@@ -280,20 +283,27 @@ SampleResult wave_merge_sample_results(SampleResult local) {
         r.mean[i] = mean;
         r.m2[i] = m2;
     }
+    r.max_walk_steps = WaveActiveMax(local.max_walk_steps);
     return r;
+}
+
+struct Param {
+    u32 seed;
 }
 
 [shader("compute")]
 [numthreads(WORKGROUP_SIZE,1,1)]
-void sample_walk(uint3 global_thread_id: SV_DispatchThreadID, uint3 group_thread_id: SV_GroupThreadID, uint3 workgroup_id: SV_GroupID) {
+void sample_walk(uniform Param param, uint3 global_thread_id: SV_DispatchThreadID, uint3 group_thread_id: SV_GroupThreadID, uint3 workgroup_id: SV_GroupID) {
     bool DEBUG = (workgroup_id.x == 0);
 
     f32 epsilon = EPSILON_ZERO;
 
-    uint4 seed = uint4(consts.seed, global_thread_id.x, 0, 0);
+    uint4 seed = uint4(param.seed, global_thread_id.x, 0, 0);
 
     SampleResult local_sample_result;
     local_sample_result.sample_count = 0;
+    local_sample_result.sample_count_high = 0;
+    local_sample_result.max_walk_steps = 0;
     for (u32 i = 0; i < PLATE_COUNT; i++) {
         local_sample_result.mean[i] = 0.0;
         local_sample_result.m2[i] = 0.0;
@@ -318,9 +328,10 @@ void sample_walk(uint3 global_thread_id: SV_DispatchThreadID, uint3 group_thread
 
     f32 w = -epsilon * (1.0 / pg) * (3.0 / (2.0 * r)) * dot(n, dir);
 
-    uint id_a = walk_on_sphere(seed, x_p, DEBUG, group_thread_id.x);
+    uint walk_steps = 0;
+    uint id_a = walk_on_sphere(seed, x_p, DEBUG, group_thread_id.x, walk_steps);
     seed.z += 1;
-    uint id_b = walk_on_sphere(seed, x_m, DEBUG, group_thread_id.x);
+    uint id_b = walk_on_sphere(seed, x_m, DEBUG, group_thread_id.x, walk_steps);
     seed.z += 1;
     if (DEBUG)
     if (WaveIsFirstLane()) {
@@ -335,25 +346,14 @@ void sample_walk(uint3 global_thread_id: SV_DispatchThreadID, uint3 group_thread
     if (id_b != INVALID) {
         result[id_b] += -w;
     }
-    add_sample_result(local_sample_result, result);
+    add_sample_result(local_sample_result, result, walk_steps);
     }
-#if 1
+
     GroupMemoryBarrierWithGroupSync();
 
     SampleResult wave_sample_result = wave_merge_sample_results(local_sample_result);
 
     if (group_thread_id.x == 0) {
         output[workgroup_id.x] = wave_sample_result;
-
-#if 0
-        for (u32 i = 0; i < PLATE_COUNT; i++) {
-            f32 result = 0.0;
-            for (u32 j = 0; j < WORKGROUP_SIZE; j++) {
-                result += shared_result[j*PLATE_COUNT + i];
-            }
-            output[workgroup_id.x * PLATE_COUNT + i] = result / WORKGROUP_SIZE;
-        }
-#endif
     }
-    #endif
 }

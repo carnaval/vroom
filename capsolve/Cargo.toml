@@ -15,3 +15,4 @@ shader-slang = {
     branch = "main"
 }
 wgpu = {version="30.0.0", features=["spirv"]}
+ash = "0.38"

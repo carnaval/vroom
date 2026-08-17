@@ -183,6 +183,7 @@ dependencies = [
 name = "capsolve"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "bytemuck",
  "env_logger",
  "fastrand",
