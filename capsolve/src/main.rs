@@ -694,7 +694,7 @@ fn compile_shaders<Param>(
 }
 
 const WORKGROUP_COUNT: u32 = 4 * 16 * 16; //128 * 256;
-
+//const WORKGROUP_COUNT: u32 = 1;
 fn main_gpu() {
     env_logger::init();
 

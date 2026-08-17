@@ -162,7 +162,7 @@ static const f32 EPSILON_ZERO = 8.8541878188e-12;
 
 static const u32 INVALID = 0xffffffff;
 
-static const f32 SURFACE_TOL = 1e-8;
+static const f32 SURFACE_TOL = 1e-6;
 
 f32x3 sample_conditional_return_on_sphere(f32x3 x, f32x3 center, f32 a, f32x2 rand) {
     f32x3 v = x - center;
@@ -187,58 +187,50 @@ f32x3 sample_conditional_return_on_sphere(f32x3 x, f32x3 center, f32 a, f32x2 ra
 
 groupshared f32 op_count;
 groupshared f32 op_wave_pct;
-u32 walk_on_sphere(uint4 seed, f32x3 sp, bool DEBUG, uint thread_id, inout uint walk_steps) {
-    f32 outside_radius = 0.25;
-    u32 step_count = 0;
-    op_count = 0;
-    op_wave_pct = 0;
-    //for (i32 it = 0; it < 3000; it++) {
-    while (true) {
-        if (DEBUG) {
-            uint4 wave_mask = WaveActiveBallot(true);
-            if (WaveIsFirstLane()) {
-                op_count += 1.0;
-                u32 lane_count = countbits(wave_mask.x) + countbits(wave_mask.y);
-                op_wave_pct += ((f32)lane_count) / 64.0;
-                printf("[%u]    it = %u, lanes = %u\n", thread_id, step_count, lane_count);
-            }
-        }
-        f32 sp_d2 = dot(sp,sp);
-        if (sp_d2 > 4.0 * outside_radius * outside_radius) {
-            f32 return_proba = outside_radius / sqrt(sp_d2);
-            uint4 rand = pcg4d(seed);
-            seed.w += 1;
-            if (u32_to_f32_01(rand.x) > return_proba) {
-                if (DEBUG) {
-                printf("[%u] EXIT: step_count = %u\n", thread_id, step_count);
-                }
 
-                return INVALID;
-            }
-            sp = sample_conditional_return_on_sphere(sp, 0.xxx, outside_radius, f32x2(u32_to_f32_01(rand.y), u32_to_f32_01(rand.z)));
-        }
-        ClosestPoint cp = closest(sp);
-        if (cp.sqdist < SURFACE_TOL * SURFACE_TOL){
-            if (DEBUG) {
-            printf("[%u] step_count = %u\n", thread_id, step_count);
-            }
-
-            return cp.id;
-        }
-        let d = sqrt(cp.sqdist);
-        let r = 0.999999 * d;
-        sp += r * random_dir(seed);
-        seed.w += 10; // TODO !!! correlatedd if 1, clean that up
-        step_count += 1;
-        walk_steps += 1;
-    }
-    return INVALID;
+struct WalkState {
+    uint4 seed;
+    f32x3 sp;
+    bool finished;
+    uint terminal;
+    uint step_count;
 }
 
-static const u32 WORKGROUP_SIZE = 64;
+void walk_on_sphere_step(inout WalkState state) {
+    f32 outside_radius = 0.25;
+    //for (i32 it = 0; it < 3000; it++) {
+    f32x3 sp = state.sp;
+    f32 sp_d2 = dot(sp,sp);
+    if (sp_d2 > 4.0 * outside_radius * outside_radius) {
+        f32 return_proba = outside_radius / sqrt(sp_d2);
+        uint4 rand = pcg4d(state.seed);
+        state.seed.w += 100;
+        if (u32_to_f32_01(rand.x) > return_proba) {
+            state.finished = true;
+            state.terminal = INVALID;
+            return;
+        }
+        sp = sample_conditional_return_on_sphere(sp, 0.xxx, outside_radius, f32x2(u32_to_f32_01(rand.y), u32_to_f32_01(rand.z)));
+        state.sp = sp;
+    }
+    ClosestPoint cp = closest(sp);
+    if (cp.sqdist < SURFACE_TOL * SURFACE_TOL){
+        state.finished = true;
+        state.terminal = cp.id;
+        return;
+    }
+    let d = sqrt(cp.sqdist);
+    let r = 0.999999 * d;
+    state.sp += r * random_dir(state.seed);
+    state.seed.w += 100; // TODO !!! correlatedd if 1, clean that up
+    state.step_count += 1;
+}
+
+static const u32 WORKGROUP_SIZE = 32;
 
 struct StartPoint {
-    f32x3 x;
+    f32x3 x_p;
+    f32x3 x_m;
     f32 w;
 }
 
@@ -288,6 +280,9 @@ struct Param {
     u32 seed;
 }
 
+static const u32 START_POINT_COUNT = WORKGROUP_SIZE*8;
+groupshared StartPoint start_points[START_POINT_COUNT];
+
 [shader("compute")]
 [numthreads(WORKGROUP_SIZE,1,1)]
 void sample_walk(uniform Param param, uint3 global_thread_id: SV_DispatchThreadID, uint3 group_thread_id: SV_GroupThreadID, uint3 workgroup_id: SV_GroupID) {
@@ -305,47 +300,85 @@ void sample_walk(uniform Param param, uint3 global_thread_id: SV_DispatchThreadI
         local_sample_result.m2[i] = 0.0;
     }
 
-    for (int K = 0; K < 10; K++) {
-    SurfaceSample g = sample_box_surface(consts.plates[0].box_min, consts.plates[0].box_max, seed);
-    seed.z += 1;
+    uint shared_base = group_thread_id.x * (START_POINT_COUNT/WORKGROUP_SIZE);
+    for (u32 i = 0; i < START_POINT_COUNT/WORKGROUP_SIZE; i++) {
+        SurfaceSample g = sample_box_surface(consts.plates[0].box_min, consts.plates[0].box_max, seed);
+        seed.z += 1;
+        f32x3 x = g.position;
+        f32x3 n = g.normal;
+        f32 pg = g.p;
 
-    f32x3 x = g.position;
-    f32x3 n = g.normal;
-    f32 pg = g.p;
+        f32 clearance = sqrt(closest(x).sqdist);
+        f32 r = 0.995 * clearance;
 
-    f32 clearance = sqrt(closest(x).sqdist);
-    f32 r = 0.995 * clearance;
+        f32x3 dir = random_dir(seed);
+        seed.z += 1;
 
-    f32x3 dir = random_dir(seed);
-    seed.z += 1;
+        f32x3 x_p = x + r*dir;
+        f32x3 x_m = x - r*dir;
 
-    f32x3 x_p = x + r*dir;
-    f32x3 x_m = x - r*dir;
-
-    f32 w = -epsilon * (1.0 / pg) * (3.0 / (2.0 * r)) * dot(n, dir);
-
-    uint walk_steps = 0;
-    uint id_a = walk_on_sphere(seed, x_p, DEBUG, group_thread_id.x, walk_steps);
-    seed.z += 1;
-    uint id_b = walk_on_sphere(seed, x_m, DEBUG, group_thread_id.x, walk_steps);
-    seed.z += 1;
-    if (DEBUG)
-    if (WaveIsFirstLane()) {
-        printf("OP count %f, avg eff = %f\n", op_count, op_wave_pct / op_count);
+        f32 w = -epsilon * (1.0 / pg) * (3.0 / (2.0 * r)) * dot(n, dir);
+        start_points[shared_base + i] = StartPoint(x_p, x_m, w);
     }
 
-    f32 result[PLATE_COUNT] = {};
-    for (u32 i = 0; i < PLATE_COUNT; i++) { result[i] = 0.0; }
-    if (id_a != INVALID) {
-        result[id_a] += w;
-    }
-    if (id_b != INVALID) {
-        result[id_b] += -w;
-    }
-    add_sample_result(local_sample_result, result, walk_steps);
+
+    WalkState state = {};
+    state.seed = seed;
+    state.finished = false;
+    state.step_count = 0;
+    u32 next_start_point = 0;
+    bool finished_xp;
+    bool reload = true;
+    uint id_xp;
+    uint id_xm;
+    StartPoint start_point;
+    bool DEBUG2 = false;
+    for (int K = 0; K < 4000; K++) {
+        uint needed_start_point_count = WaveActiveSum(reload ? 1 : 0);
+        uint start_point_index = next_start_point + WavePrefixSum(reload ? 1 : 0);
+        next_start_point += needed_start_point_count;
+        if (WaveIsFirstLane()) {
+            printf("[it:%u] needed starts = %u, next_start = %u\n", K, needed_start_point_count, next_start_point);
+        }
+        if (reload) {
+            //if (DEBUG2) printf("   (%u) reload with %u\n", group_thread_id.x, start_point_index);
+
+            if (start_point_index >= START_POINT_COUNT) break;
+            finished_xp = false;
+            reload = false;
+            start_point = start_points[start_point_index];
+            state.sp = start_point.x_p;
+        }
+        walk_on_sphere_step(state);
+
+        if (state.finished) {
+            state.finished = false;
+            if (!finished_xp) {
+                finished_xp = true;
+                id_xp = state.terminal;
+                state.sp = start_point.x_m;
+            } else {
+                id_xm = state.terminal;
+
+                f32 result[PLATE_COUNT] = {};
+                for (u32 i = 0; i < PLATE_COUNT; i++) { result[i] = 0.0; }
+                if (id_xp != INVALID) {
+                    result[id_xp] += start_point.w;
+                }
+                if (id_xm != INVALID) {
+                    result[id_xm] += -start_point.w;
+                }
+                add_sample_result(local_sample_result, result, state.step_count);
+
+                reload = true;
+            }
+        }
     }
 
     GroupMemoryBarrierWithGroupSync();
+    if (group_thread_id.x == 0) {
+        printf("FINISHED !!!!!\n");
+    }
 
     SampleResult wave_sample_result = wave_merge_sample_results(local_sample_result);
 
