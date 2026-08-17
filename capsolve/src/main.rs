@@ -693,7 +693,7 @@ fn compile_shaders<Param>(
     //println!("spirv = {spirv:?}");
 }
 
-const WORKGROUP_COUNT: u32 = 4 * 16 * 16; //128 * 256;
+const WORKGROUP_COUNT: u32 = 2 * 16 * 16; //128 * 256;
 //const WORKGROUP_COUNT: u32 = 1;
 fn main_gpu() {
     env_logger::init();

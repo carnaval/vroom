@@ -280,15 +280,42 @@ struct Param {
     u32 seed;
 }
 
-static const u32 START_POINT_COUNT = WORKGROUP_SIZE*8;
+static const u32 START_POINT_COUNT = WORKGROUP_SIZE*2;
+
 groupshared StartPoint start_points[START_POINT_COUNT];
+
+static const f32 epsilon = EPSILON_ZERO;
+
+u32 refill_start_points(u32 base_index, inout uint4 seed) {
+    if (base_index >= WORKGROUP_SIZE) {
+        return 0;
+    }
+    u32 local_index = base_index + WaveGetLaneIndex();
+    SurfaceSample g = sample_box_surface(consts.plates[0].box_min, consts.plates[0].box_max, seed);
+    seed.z += 1;
+    f32x3 x = g.position;
+    f32x3 n = g.normal;
+    f32 pg = g.p;
+
+    f32 clearance = sqrt(closest(x).sqdist);
+    f32 r = 0.995 * clearance;
+
+    f32x3 dir = random_dir(seed);
+    seed.z += 1;
+
+    f32x3 x_p = x + r*dir;
+    f32x3 x_m = x - r*dir;
+
+    f32 w = -epsilon * (1.0 / pg) * (3.0 / (2.0 * r)) * dot(n, dir);
+    start_points[local_index] = StartPoint(x_p, x_m, w);
+
+    return WORKGROUP_SIZE;
+}
 
 [shader("compute")]
 [numthreads(WORKGROUP_SIZE,1,1)]
 void sample_walk(uniform Param param, uint3 global_thread_id: SV_DispatchThreadID, uint3 group_thread_id: SV_GroupThreadID, uint3 workgroup_id: SV_GroupID) {
     bool DEBUG = (workgroup_id.x == 0);
-
-    f32 epsilon = EPSILON_ZERO;
 
     uint4 seed = uint4(param.seed, global_thread_id.x, 0, 0);
 
@@ -300,6 +327,7 @@ void sample_walk(uniform Param param, uint3 global_thread_id: SV_DispatchThreadI
         local_sample_result.m2[i] = 0.0;
     }
 
+    #if 0
     uint shared_base = group_thread_id.x * (START_POINT_COUNT/WORKGROUP_SIZE);
     for (u32 i = 0; i < START_POINT_COUNT/WORKGROUP_SIZE; i++) {
         SurfaceSample g = sample_box_surface(consts.plates[0].box_min, consts.plates[0].box_max, seed);
@@ -320,32 +348,52 @@ void sample_walk(uniform Param param, uint3 global_thread_id: SV_DispatchThreadI
         f32 w = -epsilon * (1.0 / pg) * (3.0 / (2.0 * r)) * dot(n, dir);
         start_points[shared_base + i] = StartPoint(x_p, x_m, w);
     }
+    #endif
 
+    u32 start_point_count = 0;
+    //refill_start_points(start_point_count, seed);
 
     WalkState state = {};
     state.seed = seed;
     state.finished = false;
     state.step_count = 0;
-    u32 next_start_point = 0;
     bool finished_xp;
     bool reload = true;
+    bool done = false;
     uint id_xp;
     uint id_xm;
     StartPoint start_point;
     bool DEBUG2 = false;
-    for (int K = 0; K < 4000; K++) {
+    u32 done_steps = 0;
+    static const u32 STEP_COUNT_BEFORE_WIND_DOWN = 5000;
+    for (int K = 0; K < 100000; K++) {
         uint needed_start_point_count = WaveActiveSum(reload ? 1 : 0);
-        uint start_point_index = next_start_point + WavePrefixSum(reload ? 1 : 0);
-        next_start_point += needed_start_point_count;
-        if (WaveIsFirstLane()) {
-            printf("[it:%u] needed starts = %u, next_start = %u\n", K, needed_start_point_count, next_start_point);
+        if (needed_start_point_count > start_point_count) {
+            start_point_count += refill_start_points(start_point_count, seed);
         }
+        uint start_point_index = start_point_count - 1 - WavePrefixSum(reload ? 1 : 0);
+        start_point_count -= needed_start_point_count;
+        if (WaveIsFirstLane()) {
+            printf("[it:%u] needed starts = %u, start count = %u\n", K, needed_start_point_count, start_point_count);
+        }
+        done_steps += 1;
+
+        if (WaveActiveAllTrue(done)) {
+            break;
+        }
+        if (done) {
+            continue;
+        }
+
         if (reload) {
+            reload = false;
             //if (DEBUG2) printf("   (%u) reload with %u\n", group_thread_id.x, start_point_index);
 
-            if (start_point_index >= START_POINT_COUNT) break;
+            if (done_steps >= STEP_COUNT_BEFORE_WIND_DOWN) {
+                done = true;
+                continue;
+            }
             finished_xp = false;
-            reload = false;
             start_point = start_points[start_point_index];
             state.sp = start_point.x_p;
         }
