@@ -15,7 +15,7 @@ use wgpu::{
 use winit::platform::{pump_events::EventLoopExtPumpEvents as _, windows::WindowExtWindows};
 
 use fastrand::Rng;
-use glam::{IVec2, Vec2, Vec3, ivec2, vec2, vec3};
+use glam::{IVec2, Mat4, Quat, Vec2, Vec3, ivec2, vec2, vec3};
 
 struct SurfaceSample {
     position: Vec3,
@@ -167,6 +167,12 @@ impl SampleResult {
 #[repr(C)]
 struct Consts {
     plates: [PlateInfo; PLATE_COUNT],
+}
+
+#[derive(Pod, Clone, Copy, Zeroable)]
+#[repr(C)]
+struct ViewConsts {
+    view_to_world: [f32; 16],
 }
 
 impl Plate {
@@ -525,18 +531,19 @@ fn compile_shaders<Param>(
     //bind_group_layout: wgpu::BindGroupLayout,
     entry_point_names: &[&str],
 ) -> Shaders {
-    let common = include_str!("common.slang");
+    let common_source = include_str!("common.slang");
     let global_session = shader_slang::GlobalSession::new().unwrap();
     println!("tag = {:?}", global_session.build_tag_string());
     let target = shader_slang::TargetDesc::default()
         .format(shader_slang::CompileTarget::Spirv)
         .profile(global_session.find_profile("spirv_1_5"));
-    let source = format!("{}\n{}", common, source);
+
     let targets = [target];
 
     let options = shader_slang::CompilerOptions::default()
         .vulkan_use_entry_point_name(true)
         .debug_information(shader_slang::DebugInfoLevel::Minimal)
+        .matrix_layout_column(true)
         .optimization(shader_slang::OptimizationLevel::None);
     let session_desc = shader_slang::SessionDesc::default()
         .targets(&targets)
@@ -547,6 +554,9 @@ fn compile_shaders<Param>(
         .expect("failed to create slang compilation session");
     let shader = session
         .load_module_from_source_string("my_shader", path, &source)
+        .expect("failed to load slang module");
+    let common_module = session
+        .load_module_from_source_string("common", "src/common.slang", &common_source)
         .expect("failed to load slang module");
 
     let entries: Vec<_> = entry_point_names
@@ -573,6 +583,7 @@ fn compile_shaders<Param>(
         .create_composite_component_type(&[
             shader.clone().into(),
             spec_module.into(),
+            common_module.into(),
             entries[0].clone().into(),
         ])
         .expect("failed to create composite slang component (?)");
@@ -839,7 +850,7 @@ fn main_gpu() {
 
     let shaders = compile_shaders::<Param>(
         &gpu,
-        "shader.slang",
+        "src/shader.slang",
         include_str!("shader.slang"),
         &["sample_walk"],
     );
@@ -1017,6 +1028,24 @@ fn main_gpu() {
                     timestamp_writes: None,
                 });
 
+                let view_to_world = Mat4::from_scale_rotation_translation(
+                    Vec3::ONE,
+                    Quat::from_axis_angle(Vec3::X, -PI * 0.5),
+                    vec3(0.0, -0.1, 0.05),
+                );
+
+                let view_consts = ViewConsts {
+                    view_to_world: view_to_world.to_cols_array(),
+                };
+
+                let view_const_buffer =
+                    gpu.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::bytes_of(&view_consts),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
+
                 let view_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &view_shader.bind_group_layouts[0],
@@ -1031,6 +1060,14 @@ fn main_gpu() {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &view_const_buffer,
+                                offset: 0,
+                                size: None,
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
                             resource: wgpu::BindingResource::TextureView(&backbuffer_view),
                         },
                     ],

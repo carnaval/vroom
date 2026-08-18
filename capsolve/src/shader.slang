@@ -1,3 +1,6 @@
+import common;
+
+
 [vk_binding(0, 0)]
 ConstantBuffer<Consts, CDataLayout> consts;
 [vk_binding(1, 0)]
