@@ -1,0 +1,4 @@
+(sym_lib_table
+	(version 7)
+	(lib (name "symbol") (type "KiCad") (uri "C:/code/vroom/encoder/lib/symbol") (options "") (descr ""))
+)
